@@ -1,0 +1,19 @@
+services:
+  pandaproxy:
+    image: ghcr.io/karaktaka/pandaproxy:latest
+    container_name: pandaproxy
+    restart: unless-stopped
+    environment:
+      - PRINTER_IP=${PRINTER_IP:?PRINTER_IP is required}
+      - ACCESS_CODE=${ACCESS_CODE:?ACCESS_CODE is required}
+      - BIND_ADDRESS=0.0.0.0
+    ports:
+      # Chamber image stream (A1/P1 printers)
+      - "6000:6000"
+      # RTSP camera stream (X1/H2/P2 printers)
+      - "322:322"
+    # Allow binding to privileged ports
+    cap_add:
+      - NET_BIND_SERVICE
+    # Optional: use host network for easier access
+    # network_mode: host
