@@ -14,10 +14,12 @@ class StreamClient:
     """Represents a connected client with its own message queue."""
 
     client_id: str
-    queue: asyncio.Queue[bytes | None] = field(default_factory=lambda: asyncio.Queue(maxsize=100))
+    queue: asyncio.Queue[bytes | list[bytes] | None] = field(
+        default_factory=lambda: asyncio.Queue(maxsize=100)
+    )
     connected: bool = True
 
-    async def send(self, data: bytes) -> bool:
+    async def send(self, data: bytes | list[bytes]) -> bool:
         """Queue data for sending to this client. Returns False if queue is full."""
         if not self.connected:
             return False
@@ -28,7 +30,7 @@ class StreamClient:
             logger.warning("Client %s queue full, dropping frame", self.client_id)
             return False
 
-    async def receive(self) -> bytes | None:
+    async def receive(self) -> bytes | list[bytes] | None:
         """Get next data from queue. Returns None when disconnected."""
         return await self.queue.get()
 
@@ -103,7 +105,7 @@ class StreamFanout:
                 len(self._clients),
             )
 
-    async def broadcast(self, data: bytes) -> int:
+    async def broadcast(self, data: bytes | list[bytes]) -> int:
         """Broadcast data to all connected clients. Returns number of successful sends."""
         if not self._clients:
             return 0

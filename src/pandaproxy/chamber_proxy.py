@@ -139,7 +139,7 @@ class ChamberImageProxy:
                     )
 
                     # Broadcast header + jpeg to all clients (same format as printer sends)
-                    await self._fanout.broadcast(header + jpeg_data)
+                    await self._fanout.broadcast([header, jpeg_data])
 
             except TimeoutError:
                 logger.warning("Upstream connection timeout")
@@ -209,8 +209,13 @@ class ChamberImageProxy:
                     if data is None:
                         break
                     try:
-                        writer.write(data)
-                        await writer.drain()
+                        if isinstance(data, list):
+                            for chunk in data:
+                                writer.write(chunk)
+                                await writer.drain()
+                        else:
+                            writer.write(data)
+                            await writer.drain()
                     except (ConnectionResetError, BrokenPipeError):
                         break
             finally:
