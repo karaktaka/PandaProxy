@@ -99,7 +99,6 @@ source = { editable = "." }
 dependencies = [
     { name = "aiomqtt" },
     { name = "amqtt" },
-    { name = "typer" },
 ]
 
 [package.dev-dependencies]
@@ -111,7 +110,6 @@ dev = [
 requires-dist = [
     { name = "aiomqtt", specifier = ">=2.5.0" },
     { name = "amqtt", specifier = ">=0.11.0" },
-    { name = "typer", specifier = "==0.15.4" },
 ]
 
 [package.metadata.requires-dev]

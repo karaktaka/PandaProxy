@@ -11,12 +11,13 @@ import typer
 
 from pandaproxy.chamber_proxy import ChamberImageProxy
 from pandaproxy.detection import detect_camera_type
+from pandaproxy.ftp_proxy import FTPProxy
 from pandaproxy.mqtt_proxy import MQTTProxy
 from pandaproxy.rtsp_proxy import RTSPProxy
 
 app = typer.Typer(
     name="PandaProxy",
-    help="BambuLab Multi-Service Proxy - Proxy camera and MQTT from BambuLab printers to multiple clients.",
+    help="BambuLab Multi-Service Proxy - Proxy camera, MQTT, and FTP from BambuLab printers to multiple clients.",
     add_completion=False,
 )
 
@@ -43,8 +44,12 @@ def check_dependencies(services: set[str], camera_type: str | None) -> tuple[boo
         elif camera_type == "chamber" and not shutil.which("openssl"):
             missing.append("openssl")
 
-    # MQTT proxy needs openssl for TLS cert generation
-    if "mqtt" in services and not shutil.which("openssl") and "openssl" not in missing:
+    # MQTT and FTP proxies need openssl for TLS cert generation
+    if (
+        ("mqtt" in services or "ftp" in services)
+        and not shutil.which("openssl")
+        and "openssl" not in missing
+    ):
         missing.append("openssl")
 
     return len(missing) == 0, missing
@@ -52,7 +57,7 @@ def check_dependencies(services: set[str], camera_type: str | None) -> tuple[boo
 
 def parse_services(services_str: str | None, enable_all: bool) -> set[str]:
     """Parse services string into a set of service names."""
-    all_services = {"camera", "mqtt"}
+    all_services = {"camera", "mqtt", "ftp"}
 
     if enable_all:
         return all_services
@@ -84,6 +89,7 @@ async def run_proxy(
     chamber_proxy: ChamberImageProxy | None = None
     rtsp_proxy: RTSPProxy | None = None
     mqtt_proxy: MQTTProxy | None = None
+    ftp_proxy: FTPProxy | None = None
 
     # Setup signal handlers for graceful shutdown
     stop_event = asyncio.Event()
@@ -125,6 +131,15 @@ async def run_proxy(
             )
             await mqtt_proxy.start()
 
+        # Start FTP proxy if enabled
+        if "ftp" in services:
+            ftp_proxy = FTPProxy(
+                printer_ip=printer_ip,
+                access_code=access_code,
+                bind_address=bind,
+            )
+            await ftp_proxy.start()
+
         # Print startup banner
         typer.echo("\n" + "=" * 60)
         typer.echo("PandaProxy is running!")
@@ -142,6 +157,9 @@ async def run_proxy(
 
         if "mqtt" in services:
             typer.echo(f"  MQTT: mqtts://{bind}:8883 (TLS)")
+
+        if "ftp" in services:
+            typer.echo(f"  FTP: ftps://{bind}:990 (implicit TLS, active mode only)")
 
         typer.echo("=" * 60)
         if not (os.path.exists("/.dockerenv") or os.environ.get("RUNNING_IN_DOCKER")):
@@ -161,6 +179,9 @@ async def run_proxy(
 
         if mqtt_proxy:
             await mqtt_proxy.stop()
+
+        if ftp_proxy:
+            await ftp_proxy.stop()
 
         logger.info("Shutdown complete")
 
@@ -207,7 +228,7 @@ def main(
         str | None,
         typer.Option(
             "--services",
-            help="Comma-separated list of services to enable: camera,mqtt",
+            help="Comma-separated list of services to enable: camera,mqtt,ftp",
             envvar="SERVICES",
         ),
     ] = None,
@@ -215,7 +236,7 @@ def main(
         bool,
         typer.Option(
             "--enable-all",
-            help="Enable all services (camera, mqtt)",
+            help="Enable all services (camera, mqtt, ftp)",
             envvar="ENABLE_ALL",
         ),
     ] = False,
@@ -231,20 +252,25 @@ def main(
     """Start the BambuLab multiservice proxy.
 
     This proxy connects to your BambuLab printer and serves multiple clients,
-    preventing connection limit issues. It can proxy camera streams, and MQTT
-    (for printer control/status).
+    preventing connection limit issues. It can proxy camera streams, MQTT
+    (for printer control/status), and FTP (for file uploads).
 
+    \b
     Services:
     - camera: Auto-detected (Chamber Image for A1/P1, RTSP for X1/H2/P2)
     - mqtt: MQTTS on port 8883 for printer control and status
+    - ftp: Implicit FTPS on port 990 for file uploads
 
+    \b
     Examples:
         # Camera only (default)
         pandaproxy -p 192.168.1.100 -a 12345678 -s 01P00A000000001
 
+    \b
         # All services
         pandaproxy -p 192.168.1.100 -a 12345678 -s 01P00A000000001 --enable-all
 
+    \b
         # Specific services
         pandaproxy -p 192.168.1.100 -a 12345678 -s 01P00A000000001 --services camera,mqtt
     """

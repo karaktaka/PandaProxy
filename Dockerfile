@@ -1,7 +1,7 @@
 # PandaProxy - BambuLab Camera Fan-Out Proxy
 # Multi-stage build for minimal image size
 
-FROM python:3.13-alpine AS builder
+FROM docker.io/python:3.14-alpine AS builder
 
 # Install build dependencies
 RUN apk add --no-cache \
@@ -24,14 +24,16 @@ RUN uv pip install --system --no-cache .
 
 
 # Final stage
-FROM python:3.13-alpine
+FROM docker.io/python:3.14-alpine
 
 # Install runtime dependencies
 RUN apk add --no-cache \
     ffmpeg \
     openssl \
     curl \
-    ca-certificates
+    ca-certificates \
+    libcap \
+    bash
 
 # Install MediaMTX
 ARG MEDIAMTX_VERSION=1.9.3
@@ -47,8 +49,12 @@ RUN case "${TARGETARCH}" in \
     chmod +x /usr/local/bin/mediamtx
 
 # Copy installed packages from builder
-COPY --from=builder /usr/local/lib/python3.13/site-packages /usr/local/lib/python3.13/site-packages
+COPY --from=builder /usr/local/lib/python3.14/site-packages /usr/local/lib/python3.14/site-packages
 COPY --from=builder /usr/local/bin/pandaproxy /usr/local/bin/pandaproxy
+
+# Allow binding to privileged ports (<1024) as non-root
+RUN setcap 'cap_net_bind_service=+ep' /usr/local/bin/python3.14 && \
+    setcap 'cap_net_bind_service=+ep' /usr/local/bin/mediamtx
 
 # Create non-root user
 RUN adduser -D -u 1000 pandaproxy

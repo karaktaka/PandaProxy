@@ -1,6 +1,6 @@
 """BambuLab protocol constants and utilities.
 
-Shared utilities for camera proxies, MQTT proxy, and detection modules.
+Shared utilities for camera proxies, MQTT proxy, FTP proxy, and detection modules.
 """
 
 import asyncio
@@ -12,6 +12,7 @@ import struct
 RTSP_PORT = 322
 CHAMBER_PORT = 6000
 MQTT_PORT = 8883
+FTP_PORT = 990
 
 
 # Chamber image protocol constants
