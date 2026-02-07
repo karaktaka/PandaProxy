@@ -145,8 +145,8 @@ class FTPProxy:
                     await asyncio.wait([t1, t2], return_when=asyncio.FIRST_COMPLETED)
                     t1.cancel()
                     t2.cancel()
-                except Exception as e:
-                    logger.error("Data proxy error: %s", e)
+                except Exception as exc:
+                    logger.error("Data proxy error: %s", exc)
                 finally:
                     await close_writer(w)
                     if target_w:
@@ -176,8 +176,8 @@ class FTPProxy:
                         await upstream_writer.drain()
                 except asyncio.CancelledError:
                     pass
-                except Exception as e:
-                    logger.error("Error forwarding C->P: %s", e)
+                except Exception as exc:
+                    logger.error("Error forwarding C->P: %s", exc)
 
             async def forward_printer_to_client():
                 """Forward responses from printer to client, rewriting PASV."""
@@ -235,15 +235,15 @@ class FTPProxy:
                                         new_resp = f"{prefix}{new_args}{suffix}"
                                         logger.info("Rewrote PASV: %s -> %s", resp_str, new_resp)
                                         line = (new_resp + "\r\n").encode("utf-8")
-                        except Exception as e:
-                            logger.error("Error parsing PASV: %s", e)
+                        except Exception as exc:
+                            logger.error("Error parsing PASV: %s", exc)
 
                         client_writer.write(line)
                         await client_writer.drain()
                 except asyncio.CancelledError:
                     pass
-                except Exception as e:
-                    logger.error("Error forwarding P->C: %s", e)
+                except Exception as exc:
+                    logger.error("Error forwarding P->C: %s", exc)
 
             # Start tasks
             task1 = asyncio.create_task(forward_client_to_printer(), name=f"ftp_c2p_{client_id}")

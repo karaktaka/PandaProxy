@@ -10,7 +10,10 @@ import contextlib
 import logging
 import os
 import shutil
+import tempfile
 from pathlib import Path
+
+import ffmpeg
 
 logger = logging.getLogger(__name__)
 
@@ -176,7 +179,10 @@ class RTSPProxy:
         )
 
         # Create temp config file
-        config_path = Path("/tmp/pandaproxy_mediamtx.yml")
+        fd, path = tempfile.mkstemp(prefix="pandaproxy_mediamtx_", suffix=".yml")
+        os.close(fd)
+        config_path = Path(path)
+
         config_path.write_text(config_content)
         logger.debug("Created MediaMTX config at %s", config_path)
 
@@ -206,30 +212,29 @@ class RTSPProxy:
         # MediaMTX publish URL (internal, no auth needed for publisher)
         publish_url = f"rtsp://bblp:{self.access_code}@127.0.0.1:{self.port}/stream"
 
-        cmd = [
-            "ffmpeg",
-            "-hide_banner",
-            "-loglevel",
-            "warning",
-            # Input options
-            "-rtsp_transport",
-            "tcp",
-            "-allowed_media_types",
-            "video",  # Only video, skip audio
-            "-fflags",
-            "+genpts",
-            # Ignore SSL certificate verification (BambuLab uses self-signed)
-            "-i",
+        # Use ffmpeg-python to construct the command
+        # Note: ffmpeg-python is a wrapper that constructs the command line arguments
+        # We still execute it via asyncio.create_subprocess_exec to have async control
+        # and output capturing consistent with the rest of the application.
+
+        stream = ffmpeg.input(
             source_url,
-            # Output options - copy codec, no transcoding
-            "-c",
-            "copy",
-            "-f",
-            "rtsp",
-            "-rtsp_transport",
-            "tcp",
+            rtsp_transport="tcp",
+            allowed_media_types="video",
+            fflags="+genpts",
+        )
+
+        stream = ffmpeg.output(
+            stream,
             publish_url,
-        ]
+            c="copy",
+            f="rtsp",
+            rtsp_transport="tcp",
+        )
+
+        # Get the command arguments
+        # ffmpeg-python's compile() returns the full command list including 'ffmpeg'
+        cmd = ffmpeg.compile(stream)
 
         # Mask access code in log
         safe_cmd = " ".join(cmd).replace(self.access_code, "****")
