@@ -337,6 +337,141 @@ class TestFTPProxyIntegration:
             await proxy.stop()
 
 
+class TestOctoAppBehavior:
+    """Tests specifically designed to reproduce OctoApp FTP behavior.
+
+    Based on research:
+    - OctoApp may try EPSV before PASV
+    - May send commands in rapid succession
+    - May have specific SSL/TLS requirements
+    """
+
+    @pytest.mark.asyncio
+    async def test_epsv_fallback_to_pasv(self, mock_ftp_server, temp_certs, client_ssl_context):
+        """Test client behavior when EPSV is blocked and must fallback to PASV.
+
+        This simulates what should happen when OctoApp tries EPSV first
+        and the proxy blocks it with 502.
+        """
+        from pandaproxy.ftp_proxy import FTPProxy
+
+        server, server_port = mock_ftp_server
+        cert_path, key_path = temp_certs
+        server.pasv_ip = "127.0.0.1"
+
+        proxy = FTPProxy(
+            printer_ip="127.0.0.1",
+            access_code="testcode",
+            cert_path=cert_path,
+            key_path=key_path,
+            bind_address="127.0.0.1",
+        )
+        proxy.port = 0
+
+        try:
+            await proxy.start()
+            proxy_port = proxy._server.sockets[0].getsockname()[1]
+            proxy._ssl_context.check_hostname = False
+            proxy._ssl_context.verify_mode = ssl.CERT_NONE
+            proxy.port = server_port
+
+            reader, writer = await asyncio.open_connection(
+                "127.0.0.1", proxy_port, ssl=client_ssl_context
+            )
+
+            try:
+                # Read welcome
+                await reader.readline()
+
+                # Login
+                writer.write(b"USER bblp\r\n")
+                await writer.drain()
+                await reader.readline()
+
+                writer.write(b"PASS testcode\r\n")
+                await writer.drain()
+                await reader.readline()
+
+                # OctoApp behavior: Try EPSV first
+                writer.write(b"EPSV\r\n")
+                await writer.drain()
+                epsv_response = await asyncio.wait_for(reader.readline(), timeout=5.0)
+
+                # Should get 502 (not implemented)
+                assert b"502" in epsv_response
+
+                # Then fallback to PASV
+                writer.write(b"PASV\r\n")
+                await writer.drain()
+                pasv_response = await asyncio.wait_for(reader.readline(), timeout=5.0)
+
+                # PASV should work
+                assert b"227" in pasv_response
+
+            finally:
+                writer.close()
+                await writer.wait_closed()
+
+        finally:
+            await proxy.stop()
+
+    @pytest.mark.asyncio
+    async def test_rapid_login_sequence(self, mock_ftp_server, temp_certs, client_ssl_context):
+        """Test rapid command sequence during login.
+
+        Some clients send USER and PASS very quickly, potentially before
+        the proxy has finished processing.
+        """
+        from pandaproxy.ftp_proxy import FTPProxy
+
+        server, server_port = mock_ftp_server
+        cert_path, key_path = temp_certs
+
+        proxy = FTPProxy(
+            printer_ip="127.0.0.1",
+            access_code="testcode",
+            cert_path=cert_path,
+            key_path=key_path,
+            bind_address="127.0.0.1",
+        )
+        proxy.port = 0
+
+        try:
+            await proxy.start()
+            proxy_port = proxy._server.sockets[0].getsockname()[1]
+            proxy._ssl_context.check_hostname = False
+            proxy._ssl_context.verify_mode = ssl.CERT_NONE
+            proxy.port = server_port
+
+            reader, writer = await asyncio.open_connection(
+                "127.0.0.1", proxy_port, ssl=client_ssl_context
+            )
+
+            try:
+                # Read welcome
+                await reader.readline()
+
+                # Send USER and PASS rapidly without waiting for responses
+                writer.write(b"USER bblp\r\n")
+                writer.write(b"PASS testcode\r\n")
+                await writer.drain()
+
+                # Now read both responses
+                user_resp = await asyncio.wait_for(reader.readline(), timeout=5.0)
+                pass_resp = await asyncio.wait_for(reader.readline(), timeout=5.0)
+
+                # Both should succeed
+                assert b"331" in user_resp or b"230" in user_resp
+                assert b"230" in pass_resp
+
+            finally:
+                writer.close()
+                await writer.wait_closed()
+
+        finally:
+            await proxy.stop()
+
+
 class TestClientBehaviorSimulation:
     """Simulate different client behaviors to debug compatibility issues.
 
