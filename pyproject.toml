@@ -23,6 +23,9 @@ build-backend = "hatchling.build"
 [dependency-groups]
 dev = [
     "ruff>=0.15.0",
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.24.0",
+    "pytest-timeout>=2.3.0",
 ]
 
 [tool.hatch.build.targets.wheel]
@@ -53,3 +56,9 @@ ignore = [
 
 [tool.ruff.lint.isort]
 known-first-party = ["pandaproxy"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+timeout = 30
