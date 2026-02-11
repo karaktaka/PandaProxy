@@ -3,6 +3,9 @@
 
 FROM docker.io/python:3.14-alpine AS builder
 
+# Version from git tag (passed via --build-arg)
+ARG VERSION=0.0.0-dev
+
 # Install build dependencies
 RUN apk add --no-cache \
     gcc \
@@ -19,8 +22,8 @@ WORKDIR /app
 COPY pyproject.toml .
 COPY src/ src/
 
-# Install the package
-RUN uv pip install --system --no-cache .
+# Install the package (pretend version for hatch-vcs since no .git in container)
+RUN SETUPTOOLS_SCM_PRETEND_VERSION=${VERSION} uv pip install --system --no-cache .
 
 
 # Final stage

@@ -1,0 +1,87 @@
+name: Validate Docker Build (PR)
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "Dockerfile"
+      - "pyproject.toml"
+      - "uv.lock"
+      - "src/**"
+      - ".github/workflows/docker-pr.yml"
+
+jobs:
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          version: "latest"
+
+      - name: Set up Python
+        run: uv python install 3.14
+
+      - name: Install dependencies
+        run: uv sync --dev
+
+      - name: Run tests
+        run: uv run pytest tests/ -v --tb=short
+
+  validate:
+    name: Validate Docker Image
+    runs-on: ubuntu-latest
+    needs: test
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Extract version from git
+        id: version
+        run: |
+          # For PRs: convert git describe to PEP 440 format
+          # 0.0.1-10-g766210a → 0.0.1.dev10+g766210a
+          RAW=$(git describe --tags --always | sed 's/^v//')
+          if [[ "$RAW" =~ ^([0-9]+\.[0-9]+\.[0-9]+)-([0-9]+)-g([a-f0-9]+)$ ]]; then
+            VERSION="${BASH_REMATCH[1]}.dev${BASH_REMATCH[2]}+g${BASH_REMATCH[3]}"
+          else
+            VERSION="$RAW"
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Detected version: ${VERSION}"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: pandaproxy:pr-test
+          build-args: |
+            VERSION=${{ steps.version.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Verify version in image
+        run: |
+          EXPECTED="PandaProxy v${{ steps.version.outputs.version }}"
+          ACTUAL=$(docker run --rm pandaproxy:pr-test --version)
+          echo "Expected: ${EXPECTED}"
+          echo "Actual:   ${ACTUAL}"
+          if [[ "${ACTUAL}" != "${EXPECTED}" ]]; then
+            echo "::error::Version mismatch!"
+            exit 1
+          fi
+          echo "✅ Docker image builds and reports correct version"

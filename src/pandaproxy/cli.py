@@ -5,6 +5,7 @@ import logging
 import os
 import shutil
 import signal
+from importlib.metadata import version
 from pathlib import Path
 from typing import Annotated
 
@@ -17,6 +18,14 @@ from pandaproxy.helper import generate_self_signed_cert
 from pandaproxy.mqtt_proxy import MQTTProxy
 from pandaproxy.protocol import CERT_FILENAME, KEY_FILENAME
 from pandaproxy.rtsp_proxy import RTSPProxy
+
+
+def version_callback(value: bool) -> None:
+    """Print version and exit."""
+    if value:
+        typer.echo(f"PandaProxy v{version('PandaProxy')}")
+        raise typer.Exit()
+
 
 app = typer.Typer(
     name="PandaProxy",
@@ -201,7 +210,7 @@ async def run_proxy(
 
         # Print startup banner
         typer.echo("\n" + "=" * 60)
-        typer.echo("PandaProxy is running!")
+        typer.echo(f"PandaProxy v{version('PandaProxy')} is running!")
         typer.echo("=" * 60)
         typer.echo(f"Printer: {printer_ip}")
         typer.echo(f"Serial Number: {serial_number}")
@@ -314,6 +323,16 @@ def main(
             "--verbose",
             "-v",
             help="Enable verbose/debug logging",
+        ),
+    ] = False,
+    _version: Annotated[
+        bool,
+        typer.Option(
+            "--version",
+            "-V",
+            callback=version_callback,
+            is_eager=True,
+            help="Show version and exit.",
         ),
     ] = False,
 ) -> None:
