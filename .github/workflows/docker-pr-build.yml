@@ -67,6 +67,9 @@ jobs:
             }
 
       - name: Add reaction to comment
+        # This may fail due to GITHUB_TOKEN limitations on issue_comment events
+        # The reaction is just visual feedback, not critical to the workflow
+        continue-on-error: true
         if: steps.auth.outputs.authorized == 'true'
         uses: actions/github-script@v7
         with:
