@@ -16,6 +16,9 @@ jobs:
   check-trigger:
     name: Validate Trigger
     runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+      issues: write
     # Only run if:
     # 1. Comment is on a PR (not an issue)
     # 2. Comment body is exactly "/build-pr"
