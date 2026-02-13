@@ -180,9 +180,6 @@ async def run_proxy(
         if "ftp" in services:
             ftp_proxy = FTPProxy(
                 printer_ip=printer_ip,
-                access_code=access_code,
-                cert_path=cert_path,
-                key_path=key_path,
                 bind_address=bind,
             )
 

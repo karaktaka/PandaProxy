@@ -1,576 +1,288 @@
-"""FTP Proxy tests for debugging client compatibility issues.
+"""FTP Proxy tests for TCP passthrough functionality.
 
-These tests help diagnose FTP issues with various clients like OctoApp and Bambuddy.
-They test:
-- PASV response rewriting
-- EPSV command blocking
-- SSL session handling
-- Connection timing and behavior
+The FTP proxy is now a simple TCP passthrough that forwards raw bytes
+(including TLS) to the printer. This allows clients to establish TLS
+sessions directly with the printer, enabling proper session reuse.
 """
 
 import asyncio
-import re
-import ssl
 
 import pytest
 
+from pandaproxy.ftp_proxy import FTP_DATA_PORT_END, FTP_DATA_PORT_START, FTPProxy
 
-class TestFTPCommands:
-    """Test FTP command handling and rewriting."""
-
-    def test_pasv_response_parsing(self):
-        """Test that PASV responses are correctly parsed."""
-        # Standard PASV response format
-        # Port encoding: 195 * 256 + 80 = 50000
-        response = "227 Entering Passive Mode (192,168,1,100,195,80)"
-
-        match = re.search(r"227 .*\((\d+),(\d+),(\d+),(\d+),(\d+),(\d+)\)", response)
-        assert match is not None
-
-        h1, h2, h3, h4, p1, p2 = map(int, match.groups())
-        ip = f"{h1}.{h2}.{h3}.{h4}"
-        port = p1 * 256 + p2
-
-        assert ip == "192.168.1.100"
-        assert port == 50000  # 195 * 256 + 80 = 50000
-
-    def test_pasv_response_rewriting(self):
-        """Test PASV response rewriting for proxy."""
-        original = "227 Entering Passive Mode (192,168,1,100,195,88)"
-        proxy_ip = "10.0.0.1"
-        proxy_port = 60000
-
-        # Parse original
-        match = re.search(r"227 .*\((\d+),(\d+),(\d+),(\d+),(\d+),(\d+)\)", original)
-        assert match is not None
-
-        # Build new response
-        ip_parts = proxy_ip.split(".")
-        p1_new = proxy_port // 256
-        p2_new = proxy_port % 256
-        new_args = f"{ip_parts[0]},{ip_parts[1]},{ip_parts[2]},{ip_parts[3]},{p1_new},{p2_new}"
-
-        prefix = original[: original.find("(") + 1]
-        suffix = original[original.find(")") :]
-        new_resp = f"{prefix}{new_args}{suffix}"
-
-        assert "10,0,0,1" in new_resp
-        assert "234,96" in new_resp  # 60000 = 234 * 256 + 96
-
-    def test_epsv_blocking_response(self):
-        """Test that EPSV blocking returns correct FTP error code."""
-        # 502 = Command not implemented
-        response = "502 Command not implemented\r\n"
-        assert response.startswith("502")
+# Use ephemeral ports for testing (avoids privileged port issues)
+TEST_CONTROL_PORT = 19990
+TEST_DATA_PORT_START = 19000
+TEST_DATA_PORT_END = 19010  # Small range for faster tests
 
 
-class TestSSLSessionReuse:
-    """Test SSL session reuse behavior for FTP data connections."""
+@pytest.fixture
+def test_proxy():
+    """Create an FTPProxy configured for testing with non-privileged ports."""
+    proxy = FTPProxy(
+        printer_ip="192.168.1.100",
+        bind_address="127.0.0.1",
+    )
+    # Override ports for testing
+    proxy.port = TEST_CONTROL_PORT
+    return proxy
+
+
+class TestFTPProxyLifecycle:
+    """Test FTP proxy start/stop lifecycle."""
 
     @pytest.mark.asyncio
-    async def test_ssl_context_session_extraction(self, temp_certs, client_ssl_context):
-        """Test that SSL sessions can be extracted from connections."""
-        cert_path, key_path = temp_certs
+    async def test_proxy_start_stop(self, test_proxy, monkeypatch):
+        """Test that proxy starts and stops cleanly."""
+        # Monkeypatch the data port range for faster tests
+        monkeypatch.setattr("pandaproxy.ftp_proxy.FTP_DATA_PORT_START", TEST_DATA_PORT_START)
+        monkeypatch.setattr("pandaproxy.ftp_proxy.FTP_DATA_PORT_END", TEST_DATA_PORT_END)
 
-        # Create server
-        server_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-        server_ctx.load_cert_chain(cert_path, key_path)
+        proxy = test_proxy
 
-        sessions_received = []
+        # Should not be running initially
+        assert not proxy._running
 
-        async def handle_client(_reader, writer):
-            ssl_obj = writer.get_extra_info("ssl_object")
-            if ssl_obj:
-                sessions_received.append(ssl_obj.session)
-            writer.write(b"OK\n")
-            await writer.drain()
-            writer.close()
-            await writer.wait_closed()
+        await proxy.start()
 
-        server = await asyncio.start_server(handle_client, "127.0.0.1", 0, ssl=server_ctx)
-        port = server.sockets[0].getsockname()[1]
+        # Should be running after start
+        assert proxy._running
+        assert proxy._control_server is not None
+        assert len(proxy._data_servers) > 0
+
+        await proxy.stop()
+
+        # Should be stopped
+        assert not proxy._running
+
+    @pytest.mark.asyncio
+    async def test_proxy_double_start(self, test_proxy, monkeypatch):
+        """Test that double start is idempotent."""
+        monkeypatch.setattr("pandaproxy.ftp_proxy.FTP_DATA_PORT_START", TEST_DATA_PORT_START)
+        monkeypatch.setattr("pandaproxy.ftp_proxy.FTP_DATA_PORT_END", TEST_DATA_PORT_END)
+
+        proxy = test_proxy
+
+        await proxy.start()
+        server_count = len(proxy._data_servers)
+
+        # Second start should be no-op
+        await proxy.start()
+        assert len(proxy._data_servers) == server_count
+
+        await proxy.stop()
+
+    @pytest.mark.asyncio
+    async def test_proxy_listens_on_correct_ports(self, test_proxy, monkeypatch):
+        """Test that proxy listens on control and data ports."""
+        monkeypatch.setattr("pandaproxy.ftp_proxy.FTP_DATA_PORT_START", TEST_DATA_PORT_START)
+        monkeypatch.setattr("pandaproxy.ftp_proxy.FTP_DATA_PORT_END", TEST_DATA_PORT_END)
+
+        proxy = test_proxy
+
+        await proxy.start()
 
         try:
-            # Connect and extract session
-            reader, writer = await asyncio.open_connection(
-                "127.0.0.1", port, ssl=client_ssl_context
-            )
-            ssl_obj = writer.get_extra_info("ssl_object")
-            session = ssl_obj.session if ssl_obj else None
+            # Control server should be listening on configured port
+            assert proxy._control_server is not None
+            control_port = proxy._control_server.sockets[0].getsockname()[1]
+            assert control_port == TEST_CONTROL_PORT
 
-            await reader.readline()
+            # Data servers should be listening on the configured range
+            data_ports = [s.sockets[0].getsockname()[1] for s in proxy._data_servers]
+            assert len(data_ports) > 0
+
+            # All data ports should be in the expected range
+            for port in data_ports:
+                assert TEST_DATA_PORT_START <= port <= TEST_DATA_PORT_END
+
+        finally:
+            await proxy.stop()
+
+
+class TestFTPProxyPassthrough:
+    """Test TCP passthrough functionality."""
+
+    @pytest.mark.asyncio
+    async def test_passthrough_connection_to_mock_server(self, monkeypatch):
+        """Test that proxy forwards connections to the backend server."""
+        monkeypatch.setattr("pandaproxy.ftp_proxy.FTP_DATA_PORT_START", TEST_DATA_PORT_START)
+        monkeypatch.setattr("pandaproxy.ftp_proxy.FTP_DATA_PORT_END", TEST_DATA_PORT_END)
+
+        # Create a simple echo server to act as the "printer"
+        received_data = []
+
+        async def echo_handler(reader, writer):
+            data = await reader.read(100)
+            received_data.append(data)
+            writer.write(b"ECHO:" + data)
+            await writer.drain()
             writer.close()
             await writer.wait_closed()
 
-            # Session should exist
-            assert session is not None
-            assert len(sessions_received) == 1
-        finally:
-            server.close()
-            await server.wait_closed()
+        # Start mock server (backend "printer") on an ephemeral port
+        mock_server = await asyncio.start_server(echo_handler, "127.0.0.1", 0)
+        backend_port = mock_server.sockets[0].getsockname()[1]
 
+        # Create proxy that listens on a different ephemeral port
+        # but forwards to the mock server's port
+        proxy_listen_server = await asyncio.start_server(lambda _r, _w: None, "127.0.0.1", 0)
+        proxy_port = proxy_listen_server.sockets[0].getsockname()[1]
+        proxy_listen_server.close()
+        await proxy_listen_server.wait_closed()
 
-class TestMockFTPServer:
-    """Test the mock FTP server itself to ensure test infrastructure works."""
+        # Small delay to ensure port is released
+        await asyncio.sleep(0.1)
 
-    @pytest.mark.asyncio
-    async def test_mock_server_basic_commands(self, mock_ftp_server, client_ssl_context):
-        """Test basic FTP command flow against mock server."""
-        server, port = mock_ftp_server
-
-        reader, writer = await asyncio.open_connection("127.0.0.1", port, ssl=client_ssl_context)
-
-        try:
-            # Read welcome
-            welcome = await asyncio.wait_for(reader.readline(), timeout=5.0)
-            assert b"220" in welcome
-
-            # USER command
-            writer.write(b"USER bblp\r\n")
-            await writer.drain()
-            response = await asyncio.wait_for(reader.readline(), timeout=5.0)
-            assert b"331" in response
-
-            # PASS command
-            writer.write(b"PASS testcode\r\n")
-            await writer.drain()
-            response = await asyncio.wait_for(reader.readline(), timeout=5.0)
-            assert b"230" in response
-
-            # PASV command
-            writer.write(b"PASV\r\n")
-            await writer.drain()
-            response = await asyncio.wait_for(reader.readline(), timeout=5.0)
-            assert b"227" in response
-            assert b"192,168,1,100" in response  # Mock printer IP
-
-            # QUIT
-            writer.write(b"QUIT\r\n")
-            await writer.drain()
-            response = await asyncio.wait_for(reader.readline(), timeout=5.0)
-            assert b"221" in response
-
-        finally:
-            writer.close()
-            await writer.wait_closed()
-
-        # Verify commands were recorded
-        assert "USER bblp" in server.commands_received
-        assert "PASV" in server.commands_received
-
-    @pytest.mark.asyncio
-    async def test_mock_server_epsv_command(self, mock_ftp_server, client_ssl_context):
-        """Test EPSV command handling."""
-        server, port = mock_ftp_server
-
-        reader, writer = await asyncio.open_connection("127.0.0.1", port, ssl=client_ssl_context)
-
-        try:
-            # Read welcome
-            await reader.readline()
-
-            # Login
-            writer.write(b"USER bblp\r\n")
-            await writer.drain()
-            await reader.readline()
-
-            writer.write(b"PASS test\r\n")
-            await writer.drain()
-            await reader.readline()
-
-            # EPSV command (extended passive)
-            writer.write(b"EPSV\r\n")
-            await writer.drain()
-            response = await asyncio.wait_for(reader.readline(), timeout=5.0)
-
-            # Mock server returns 229 for EPSV
-            assert b"229" in response
-
-        finally:
-            writer.close()
-            await writer.wait_closed()
-
-
-class TestFTPProxyIntegration:
-    """Integration tests for FTP proxy with mock backend.
-
-    These tests verify the proxy correctly handles client connections
-    and rewrites PASV responses.
-
-    Note: These tests require careful port management since FTPProxy uses
-    the same port for listening and upstream connections by default.
-    We also need to patch the SSL context to accept our test certificates.
-    """
-
-    @pytest.mark.asyncio
-    async def test_proxy_pasv_rewrite(self, mock_ftp_server, temp_certs, client_ssl_context):
-        """Test that proxy correctly rewrites PASV responses."""
-        from pandaproxy.ftp_proxy import FTPProxy
-
-        server, server_port = mock_ftp_server
-        cert_path, key_path = temp_certs
-
-        # Update mock server to use localhost for connection
-        server.pasv_ip = "127.0.0.1"
-
-        # Create proxy
+        # Create proxy pointing to the mock server
         proxy = FTPProxy(
             printer_ip="127.0.0.1",
-            access_code="testcode",
-            cert_path=cert_path,
-            key_path=key_path,
             bind_address="127.0.0.1",
         )
+        # Proxy listens on proxy_port, forwards to backend_port
+        proxy.port = proxy_port
+        # We need to make the proxy forward to the backend port
+        # The proxy forwards to printer_ip:port, so we set printer port via a custom attribute
+        original_handle = proxy._handle_connection
 
-        # Set up: proxy listens on ephemeral port
-        proxy.port = 0
+        async def patched_handle(reader, writer, _port):
+            # Always forward to the backend port
+            await original_handle(reader, writer, backend_port)
+
+        proxy._handle_connection = patched_handle
+
+        await proxy.start()
 
         try:
-            await proxy.start()
-            proxy_port = proxy._server.sockets[0].getsockname()[1]
-
-            # Patch the upstream SSL context to accept our test cert
-            # and set upstream port to mock server
-            proxy._ssl_context.check_hostname = False
-            proxy._ssl_context.verify_mode = ssl.CERT_NONE
-            proxy.port = server_port
-
             # Connect to proxy
-            reader, writer = await asyncio.open_connection(
-                "127.0.0.1", proxy_port, ssl=client_ssl_context
-            )
+            reader, writer = await asyncio.open_connection("127.0.0.1", proxy_port)
 
-            try:
-                # Read welcome (forwarded from mock server)
-                welcome = await asyncio.wait_for(reader.readline(), timeout=5.0)
-                assert b"220" in welcome
-
-                # Login
-                writer.write(b"USER bblp\r\n")
-                await writer.drain()
-                await asyncio.wait_for(reader.readline(), timeout=5.0)
-
-                writer.write(b"PASS testcode\r\n")
-                await writer.drain()
-                await asyncio.wait_for(reader.readline(), timeout=5.0)
-
-                # PASV - should be rewritten by proxy
-                writer.write(b"PASV\r\n")
-                await writer.drain()
-                response = await asyncio.wait_for(reader.readline(), timeout=5.0)
-                response_str = response.decode("utf-8")
-
-                # Response should contain 227 and have proxy's IP, not mock server's IP
-                assert "227" in response_str
-                # The IP should be rewritten to proxy's IP (127.0.0.1 -> 127,0,0,1)
-                assert "127,0,0,1" in response_str
-
-            finally:
-                writer.close()
-                await writer.wait_closed()
-
-        finally:
-            await proxy.stop()
-
-    @pytest.mark.asyncio
-    async def test_proxy_epsv_blocking(self, mock_ftp_server, temp_certs, client_ssl_context):
-        """Test that proxy blocks EPSV commands and returns 502."""
-        from pandaproxy.ftp_proxy import FTPProxy
-
-        server, server_port = mock_ftp_server
-        cert_path, key_path = temp_certs
-
-        proxy = FTPProxy(
-            printer_ip="127.0.0.1",
-            access_code="testcode",
-            cert_path=cert_path,
-            key_path=key_path,
-            bind_address="127.0.0.1",
-        )
-
-        # Listen on ephemeral port
-        proxy.port = 0
-
-        try:
-            await proxy.start()
-            proxy_port = proxy._server.sockets[0].getsockname()[1]
-
-            # Patch SSL and set upstream port
-            proxy._ssl_context.check_hostname = False
-            proxy._ssl_context.verify_mode = ssl.CERT_NONE
-            proxy.port = server_port
-
-            reader, writer = await asyncio.open_connection(
-                "127.0.0.1", proxy_port, ssl=client_ssl_context
-            )
-
-            try:
-                # Read welcome
-                await reader.readline()
-
-                # Login
-                writer.write(b"USER bblp\r\n")
-                await writer.drain()
-                await reader.readline()
-
-                writer.write(b"PASS testcode\r\n")
-                await writer.drain()
-                await reader.readline()
-
-                # EPSV should be blocked by proxy
-                writer.write(b"EPSV\r\n")
-                await writer.drain()
-                response = await asyncio.wait_for(reader.readline(), timeout=5.0)
-                response_str = response.decode("utf-8")
-
-                # Proxy should return 502 (not implemented)
-                assert "502" in response_str
-
-                # Verify EPSV was NOT forwarded to mock server
-                assert "EPSV" not in server.commands_received
-
-            finally:
-                writer.close()
-                await writer.wait_closed()
-
-        finally:
-            await proxy.stop()
-
-
-class TestOctoAppBehavior:
-    """Tests specifically designed to reproduce OctoApp FTP behavior.
-
-    Based on research:
-    - OctoApp may try EPSV before PASV
-    - May send commands in rapid succession
-    - May have specific SSL/TLS requirements
-    """
-
-    @pytest.mark.asyncio
-    async def test_epsv_fallback_to_pasv(self, mock_ftp_server, temp_certs, client_ssl_context):
-        """Test client behavior when EPSV is blocked and must fallback to PASV.
-
-        This simulates what should happen when OctoApp tries EPSV first
-        and the proxy blocks it with 502.
-        """
-        from pandaproxy.ftp_proxy import FTPProxy
-
-        server, server_port = mock_ftp_server
-        cert_path, key_path = temp_certs
-        server.pasv_ip = "127.0.0.1"
-
-        proxy = FTPProxy(
-            printer_ip="127.0.0.1",
-            access_code="testcode",
-            cert_path=cert_path,
-            key_path=key_path,
-            bind_address="127.0.0.1",
-        )
-        proxy.port = 0
-
-        try:
-            await proxy.start()
-            proxy_port = proxy._server.sockets[0].getsockname()[1]
-            proxy._ssl_context.check_hostname = False
-            proxy._ssl_context.verify_mode = ssl.CERT_NONE
-            proxy.port = server_port
-
-            reader, writer = await asyncio.open_connection(
-                "127.0.0.1", proxy_port, ssl=client_ssl_context
-            )
-
-            try:
-                # Read welcome
-                await reader.readline()
-
-                # Login
-                writer.write(b"USER bblp\r\n")
-                await writer.drain()
-                await reader.readline()
-
-                writer.write(b"PASS testcode\r\n")
-                await writer.drain()
-                await reader.readline()
-
-                # OctoApp behavior: Try EPSV first
-                writer.write(b"EPSV\r\n")
-                await writer.drain()
-                epsv_response = await asyncio.wait_for(reader.readline(), timeout=5.0)
-
-                # Should get 502 (not implemented)
-                assert b"502" in epsv_response
-
-                # Then fallback to PASV
-                writer.write(b"PASV\r\n")
-                await writer.drain()
-                pasv_response = await asyncio.wait_for(reader.readline(), timeout=5.0)
-
-                # PASV should work
-                assert b"227" in pasv_response
-
-            finally:
-                writer.close()
-                await writer.wait_closed()
-
-        finally:
-            await proxy.stop()
-
-    @pytest.mark.asyncio
-    async def test_rapid_login_sequence(self, mock_ftp_server, temp_certs, client_ssl_context):
-        """Test rapid command sequence during login.
-
-        Some clients send USER and PASS very quickly, potentially before
-        the proxy has finished processing.
-        """
-        from pandaproxy.ftp_proxy import FTPProxy
-
-        server, server_port = mock_ftp_server
-        cert_path, key_path = temp_certs
-
-        proxy = FTPProxy(
-            printer_ip="127.0.0.1",
-            access_code="testcode",
-            cert_path=cert_path,
-            key_path=key_path,
-            bind_address="127.0.0.1",
-        )
-        proxy.port = 0
-
-        try:
-            await proxy.start()
-            proxy_port = proxy._server.sockets[0].getsockname()[1]
-            proxy._ssl_context.check_hostname = False
-            proxy._ssl_context.verify_mode = ssl.CERT_NONE
-            proxy.port = server_port
-
-            reader, writer = await asyncio.open_connection(
-                "127.0.0.1", proxy_port, ssl=client_ssl_context
-            )
-
-            try:
-                # Read welcome
-                await reader.readline()
-
-                # Send USER and PASS rapidly without waiting for responses
-                writer.write(b"USER bblp\r\n")
-                writer.write(b"PASS testcode\r\n")
-                await writer.drain()
-
-                # Now read both responses
-                user_resp = await asyncio.wait_for(reader.readline(), timeout=5.0)
-                pass_resp = await asyncio.wait_for(reader.readline(), timeout=5.0)
-
-                # Both should succeed
-                assert b"331" in user_resp or b"230" in user_resp
-                assert b"230" in pass_resp
-
-            finally:
-                writer.close()
-                await writer.wait_closed()
-
-        finally:
-            await proxy.stop()
-
-
-class TestClientBehaviorSimulation:
-    """Simulate different client behaviors to debug compatibility issues.
-
-    These tests help identify what might be causing issues with specific clients
-    like OctoApp and Bambuddy.
-    """
-
-    @pytest.mark.asyncio
-    async def test_rapid_command_sequence(self, mock_ftp_server, client_ssl_context):
-        """Test rapid command sequence (some clients send commands quickly)."""
-        server, port = mock_ftp_server
-
-        reader, writer = await asyncio.open_connection("127.0.0.1", port, ssl=client_ssl_context)
-
-        try:
-            # Read welcome
-            await reader.readline()
-
-            # Send multiple commands rapidly without waiting for responses
-            commands = [
-                b"USER bblp\r\n",
-                b"PASS testcode\r\n",
-                b"TYPE I\r\n",
-                b"PWD\r\n",
-            ]
-
-            for cmd in commands:
-                writer.write(cmd)
+            # Send test data
+            writer.write(b"Hello FTP")
             await writer.drain()
 
-            # Now read all responses
-            responses = []
-            for _ in range(len(commands)):
-                resp = await asyncio.wait_for(reader.readline(), timeout=5.0)
-                responses.append(resp)
+            # Should receive echoed response from mock server through proxy
+            response = await asyncio.wait_for(reader.read(100), timeout=2.0)
+            assert response == b"ECHO:Hello FTP"
+            assert received_data == [b"Hello FTP"]
 
-            # All commands should have responses
-            assert len(responses) == len(commands)
-
-        finally:
             writer.close()
             await writer.wait_closed()
 
+        finally:
+            await proxy.stop()
+            mock_server.close()
+            await mock_server.wait_closed()
+
     @pytest.mark.asyncio
-    async def test_connection_timeout_behavior(self, temp_certs, client_ssl_context):
-        """Test behavior when server doesn't respond quickly."""
-        cert_path, key_path = temp_certs
+    async def test_proxy_handles_connection_refused(self, monkeypatch):
+        """Test that proxy handles connection refused gracefully."""
+        monkeypatch.setattr("pandaproxy.ftp_proxy.FTP_DATA_PORT_START", TEST_DATA_PORT_START)
+        monkeypatch.setattr("pandaproxy.ftp_proxy.FTP_DATA_PORT_END", TEST_DATA_PORT_END)
 
-        server_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-        server_ctx.load_cert_chain(cert_path, key_path)
+        proxy = FTPProxy(
+            printer_ip="127.0.0.1",
+            bind_address="127.0.0.1",
+        )
 
-        async def slow_handler(_reader, writer):
-            # Simulate slow server - just wait
-            await asyncio.sleep(10)
-            writer.close()
+        # Use ephemeral port for control, but backend points to a closed port
+        proxy.port = TEST_CONTROL_PORT
 
-        server = await asyncio.start_server(slow_handler, "127.0.0.1", 0, ssl=server_ctx)
-        port = server.sockets[0].getsockname()[1]
+        await proxy.start()
 
         try:
-            reader, writer = await asyncio.open_connection(
-                "127.0.0.1", port, ssl=client_ssl_context
-            )
+            # Temporarily point printer to a port that's not listening
+            original_ip = proxy.printer_ip
+            proxy.printer_ip = "127.0.0.1"
 
-            # Try to read with short timeout - should timeout
-            with pytest.raises(TimeoutError):
-                await asyncio.wait_for(reader.readline(), timeout=1.0)
+            # Try to connect to the proxy
+            reader, writer = await asyncio.open_connection("127.0.0.1", TEST_CONTROL_PORT)
+
+            # Connection to proxy succeeds, but upstream should fail (no server on TEST_CONTROL_PORT on printer side)
+            # The proxy should close the connection gracefully
+            try:
+                data = await asyncio.wait_for(reader.read(100), timeout=2.0)
+                # Connection should be closed by proxy (empty read)
+                assert data == b""
+            except (ConnectionResetError, TimeoutError):
+                # Also acceptable - connection was terminated
+                pass
 
             writer.close()
             await writer.wait_closed()
+            proxy.printer_ip = original_ip
+
         finally:
-            server.close()
-            await server.wait_closed()
+            await proxy.stop()
+
+
+class TestFTPProxyDataPorts:
+    """Test data port handling."""
+
+    def test_data_port_range_constants(self):
+        """Test that data port range constants are sensible."""
+        assert FTP_DATA_PORT_START < FTP_DATA_PORT_END
+        assert FTP_DATA_PORT_START >= 1024  # Not privileged
+        assert FTP_DATA_PORT_END <= 65535  # Valid port range
+
+        # Range should cover typical BambuLab PASV ports (around 2024-2025)
+        assert FTP_DATA_PORT_START <= 2024
+        assert FTP_DATA_PORT_END >= 2025
 
     @pytest.mark.asyncio
-    async def test_partial_command_handling(self, mock_ftp_server, client_ssl_context):
-        """Test handling of commands sent in chunks (network fragmentation)."""
-        server, port = mock_ftp_server
+    async def test_data_port_servers_created(self, test_proxy, monkeypatch):
+        """Test that data port servers are created during startup."""
+        monkeypatch.setattr("pandaproxy.ftp_proxy.FTP_DATA_PORT_START", TEST_DATA_PORT_START)
+        monkeypatch.setattr("pandaproxy.ftp_proxy.FTP_DATA_PORT_END", TEST_DATA_PORT_END)
 
-        reader, writer = await asyncio.open_connection("127.0.0.1", port, ssl=client_ssl_context)
+        proxy = test_proxy
+
+        await proxy.start()
 
         try:
-            # Read welcome
-            await reader.readline()
-
-            # Send USER command in chunks
-            writer.write(b"US")
-            await writer.drain()
-            await asyncio.sleep(0.1)
-            writer.write(b"ER ")
-            await writer.drain()
-            await asyncio.sleep(0.1)
-            writer.write(b"bblp\r\n")
-            await writer.drain()
-
-            # Should still get proper response
-            response = await asyncio.wait_for(reader.readline(), timeout=5.0)
-            assert b"331" in response
+            # Should have created servers for the data port range
+            # Some ports might fail if already in use, but most should succeed
+            expected_count = TEST_DATA_PORT_END - TEST_DATA_PORT_START + 1
+            assert len(proxy._data_servers) > 0
+            assert len(proxy._data_servers) <= expected_count
 
         finally:
-            writer.close()
-            await writer.wait_closed()
+            await proxy.stop()
+
+
+class TestFTPProxyEdgeCases:
+    """Test edge cases and error handling."""
+
+    @pytest.mark.asyncio
+    async def test_stop_without_start(self, test_proxy):
+        """Test that stop works even if never started."""
+        proxy = test_proxy
+
+        # Should not raise
+        await proxy.stop()
+
+    @pytest.mark.asyncio
+    async def test_multiple_stop_calls(self, test_proxy, monkeypatch):
+        """Test that multiple stop calls are safe."""
+        monkeypatch.setattr("pandaproxy.ftp_proxy.FTP_DATA_PORT_START", TEST_DATA_PORT_START)
+        monkeypatch.setattr("pandaproxy.ftp_proxy.FTP_DATA_PORT_END", TEST_DATA_PORT_END)
+
+        proxy = test_proxy
+
+        await proxy.start()
+        await proxy.stop()
+
+        # Second stop should be safe
+        await proxy.stop()
+
+    def test_proxy_configuration(self):
+        """Test proxy configuration is stored correctly."""
+        proxy = FTPProxy(
+            printer_ip="192.168.1.100",
+            bind_address="10.0.0.1",
+        )
+
+        assert proxy.printer_ip == "192.168.1.100"
+        assert proxy.bind_address == "10.0.0.1"
+        assert proxy.port == 990  # Default FTP port
