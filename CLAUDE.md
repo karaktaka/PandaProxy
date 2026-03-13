@@ -32,14 +32,18 @@ uv sync
 # Run the CLI
 uv run pandaproxy -p <PRINTER_IP> -a <ACCESS_CODE> -s <SERIAL_NUMBER>
 
-# Run tests
+# Run tests (asyncio_mode = "auto" — no @pytest.mark.asyncio needed)
 uv run pytest tests/ -v
+uv run pytest tests/ --cov          # With coverage
 
 # Lint
 uv run ruff check .
 
 # Format
 uv run ruff format .
+
+# Git hooks (run once after cloning)
+uv run pre-commit install
 ```
 
 ## Project Structure
@@ -66,25 +70,6 @@ src/pandaproxy/
 - **Logging:** Use standard `logging` module
 - **Line Length:** 100 characters (configured in `pyproject.toml`)
 
-## Git Workflow
-
-### Commits
-
-This is a **GitHub repository**. All commits should include the co-author line:
-
-```
-Co-Authored-By: Claude <noreply@anthropic.com>
-```
-
-Use conventional commit format: `feat:`, `fix:`, `refactor:`, `docs:`, `test:`, `chore:`
-
-### Versioning
-
-Versions are derived from git tags via `hatch-vcs`:
-
-- Tags: `v0.0.1` → version `0.0.1`
-- Dev builds: `0.0.1-10-g766210a` → `0.0.1.dev10+g766210a`
-
 ## CI/CD
 
 GitHub Actions workflows:
@@ -110,10 +95,12 @@ act <event> -e <event.json> -l -W .github/workflows/<workflow>.yml
 ```
 
 **Tools:**
+
 - **`actionlint`**: Validates YAML syntax, action references, expressions, and shellcheck integration
 - **`act`**: Simulates workflow execution using Docker; useful for testing job dependencies and `if` conditions
 
 **Tips:**
+
 - Empty output from `act -n` means the job's `if` condition filtered it out
 - For Apple Silicon: add `--container-architecture linux/amd64` to `act` commands
 - Create mock event payloads in `/tmp/` for testing different trigger scenarios
